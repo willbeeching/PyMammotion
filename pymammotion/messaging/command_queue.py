@@ -159,7 +159,13 @@ class DeviceCommandQueue:
                 from pymammotion.aliyun.exceptions import GatewayTimeoutException, TooManyRequestsException
 
                 _RETRY_MAX = 3
-                _RATE_LIMIT_BACKOFFS = (3.0, 6.0, 10.0)
+                # Exponential base for TooManyRequestsException backoff between
+                # per-command retries. Note that CloudIOTGateway.AdaptiveRateLimiter
+                # also gates ALL outbound sends after a 429, so this sleep is
+                # only the *additional* per-command patience — it compounds
+                # with the gateway-wide cool-down, which is what we want.
+                _RATE_LIMIT_BASE_DELAY = 2.0
+                _RATE_LIMIT_MAX_DELAY = 20.0
 
                 for _attempt in range(1, _RETRY_MAX + 1):
                     self._current_work_task = asyncio.get_running_loop().create_task(
@@ -183,7 +189,10 @@ class DeviceCommandQueue:
                                 _attempt,
                             )
                     except TooManyRequestsException:
-                        backoff = _RATE_LIMIT_BACKOFFS[min(_attempt - 1, len(_RATE_LIMIT_BACKOFFS) - 1)]
+                        import random
+
+                        target = min(_RATE_LIMIT_BASE_DELAY * (2 ** (_attempt - 1)), _RATE_LIMIT_MAX_DELAY)
+                        backoff = target + random.uniform(0, target * 0.25)
                         if _attempt < _RETRY_MAX:
                             _logger.warning(
                                 "DeviceCommandQueue[%s]: rate limited (attempt %d/%d) — retrying in %.1fs",
