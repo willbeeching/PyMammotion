@@ -268,14 +268,24 @@ class AliyunMQTTTransport(Transport):
             })
             try:
                 await self._client.publish(topic, envelope, qos=1)
+                _logger.info(
+                    "AliyunMQTTTransport: sent %d bytes via MQTT publish (msg=%s, iot_id=%s)",
+                    len(payload), message_id[:8], iot_id[:12],
+                )
                 return
             except Exception as exc:
                 _logger.warning(
                     "MQTT publish failed, falling back to HTTP: %s", exc
                 )
+        else:
+            _logger.info(
+                "AliyunMQTTTransport: MQTT not connected (client=%s, connected=%s), using HTTP for iot_id=%s",
+                self._client is not None, self.is_connected if self._client else False, iot_id[:12],
+            )
 
         try:
             await self._cloud_gateway.send_cloud_command(iot_id, payload)
+            _logger.info("AliyunMQTTTransport: sent %d bytes via HTTP API (iot_id=%s)", len(payload), iot_id[:12])
         except UnretryableException as ex:
             raise TransportError(ex.message) from None
 
