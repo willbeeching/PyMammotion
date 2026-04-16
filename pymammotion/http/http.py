@@ -17,6 +17,7 @@ from aiohttp import ClientSession
 import jwt
 
 from pymammotion.const import (
+    APP_VERSION,
     MAMMOTION_API_DOMAIN,
     MAMMOTION_CLIENT_ID,
     MAMMOTION_CLIENT_SECRET,
@@ -84,37 +85,41 @@ def sign_with_hmac_sha256(data: str, app_secret: str) -> str:
         raise RuntimeError(f"toSignWithHmacSha256 error: {e}") from e
 
 
-def create_oauth_signature(login_req: dict, client_id: str, client_secret: str, token_endpoint: str) -> str:
-    """Create OAuth signature for login request.
+def create_oauth_signature(
+    login_req: dict, client_id: str, client_secret: str, token_endpoint: str, timestamp_ms: str
+) -> str:
+    """Create OAuth signature matching the Mammotion Android app's LoginsPresenter flow.
+
+    The signed string is exactly what the app computes:
+        sign_data = client_id + timestamp_ms + token_endpoint + json(login_req)
+    where ``json(login_req)`` is Gson's default output (no HTML escaping, no spaces,
+    fields in Java declaration order, nulls skipped).  See ``LoginReq.java``:
+    the canonical field order is ``authType, client_id, grant_type, password, username``.
+
+    The HMAC-SHA256 key is the lowercase hex of ``MD5(client_secret_utf8)``.
 
     Args:
-        login_req: Login request data as dictionary
+        login_req: Login request data as dictionary (keys should already be in canonical order)
         client_id: OAuth client ID
         client_secret: OAuth client secret
         token_endpoint: Token endpoint path
+        timestamp_ms: Current time in milliseconds as string. Must be the SAME value
+            that is sent as the ``Ma-Timestamp`` header, otherwise the server will reject.
 
     Returns:
-        HMAC-SHA256 signature
+        HMAC-SHA256 hex signature
 
     """
-    # Convert dict to JSON without HTML escaping (ensure_ascii=False handles this)
     json_data = json.dumps(login_req, ensure_ascii=False, separators=(",", ":"))
 
-    # Get current timestamp in milliseconds
-    timestamp = str(int(time.time() * 1000))
+    str_to_sign = f"{client_id}{timestamp_ms}{token_endpoint}{json_data}"
 
-    # Construct the string to sign
-    str_to_sign = f"{client_id}{timestamp}{token_endpoint}{json_data}"
-
-    # Create MD5 hash of client secret
     try:
         md5_hash = hashlib.md5(client_secret.encode("utf-8")).digest()
-        # Convert to hex string
         hashed_secret = md5_hash.hex()
     except Exception:
         hashed_secret = ""
 
-    # Sign with HMAC-SHA256
     signature = sign_with_hmac_sha256(str_to_sign, hashed_secret)
 
     return signature
@@ -138,7 +143,7 @@ class MammotionHTTP:
         self._response: Response | None = None
         self.login_info: LoginResponseData | None = None
         self.jwt_info: JWTTokenInfo = JWTTokenInfo("", "")
-        self._headers = {"User-Agent": "okhttp/4.9.3", "App-Version": "Home Assistant,2.2.4.13"}
+        self._headers = {"User-Agent": "okhttp/4.9.3", "App-Version": APP_VERSION}
         self.encryption_utils = EncryptionUtils()
 
         # Add this method to generate a 10-digit random number
@@ -599,19 +604,27 @@ class MammotionHTTP:
         return login_response
 
     async def refresh_token_v2(self) -> Response[LoginResponseData]:
-        """Refresh token v2."""
+        """Refresh the OAuth access token via ``/oauth2/token`` (grant_type=refresh_token).
+
+        Uses the same header/signature/body conventions as ``login_v2`` — see its
+        docstring for why ``data=""``, ms-precision timestamp, and no extra headers
+        are critical.
+        """
 
         refresh_request = {
             "client_id": MAMMOTION_OUATH2_CLIENT_ID,
-            "refresh_token": self.login_info.refresh_token,
             "grant_type": "refresh_token",
+            "refresh_token": self.login_info.refresh_token,
         }
+
+        timestamp_ms = str(int(time.time() * 1000))
 
         oauth_signature = create_oauth_signature(
             login_req=refresh_request,
             client_id=MAMMOTION_OUATH2_CLIENT_ID,
             client_secret=MAMMOTION_OUATH2_CLIENT_SECRET,
             token_endpoint="/oauth2/token",
+            timestamp_ms=timestamp_ms,
         )
 
         async with self._client_session() as session:
@@ -619,15 +632,17 @@ class MammotionHTTP:
                 f"{MAMMOTION_DOMAIN}/oauth2/token",
                 headers={
                     **self._headers,
-                    "Ma-Iot-Signature": oauth_signature,
-                    "Ma-Timestamp": str(int(time.time())),
-                    "Client-Id": self.client_id,
-                    "Client-Type": "1",
+                    "Ma-App-Key": MAMMOTION_OUATH2_CLIENT_ID,
+                    "Ma-Signature": oauth_signature,
+                    "Ma-Timestamp": timestamp_ms,
                 },
-                params={
-                    **refresh_request,
-                },
+                params=refresh_request,
+                data="",
             )
+            if resp.status != 200:
+                body = await resp.text()
+                _LOGGER.debug("refresh_token_v2 failed (status=%s): %s", resp.status, body)
+                return Response.from_dict({"code": resp.status, "msg": "Refresh login token failed"})
             data = await resp.json()
         refresh_response = response_factory(Response[LoginResponseData], data)
         if refresh_response is None or refresh_response.data is None:
@@ -641,45 +656,59 @@ class MammotionHTTP:
         return refresh_response
 
     async def login_v2(self, account: str, password: str) -> Response[LoginResponseData]:
-        """Logs in to the service using provided account and password."""
+        """Log in via the app's encrypted ``/oauth/token`` flow.
+
+        This matches ``ReSetPasswordViewModel.loginByEmail`` in the decompiled 2.2.4.13
+        APK (see ``NewApiService.loginByEmail`` with ``Encrypt-Key`` / ``Decrypt-Type`` /
+        ``Ec-Version`` headers).  Unlike the older ``/oauth2/token`` signed flow, this
+        endpoint AES-encrypts each parameter and wraps the AES key/IV with the server's
+        RSA public key.
+
+        Each form parameter (``username``, ``client_id``, ``client_secret``,
+        ``grant_type``, ``password``) is encrypted with AES/CBC/PKCS7 using a random
+        16-char key and 16-digit IV; the key+IV is then RSA-encrypted with the
+        production public key baked into ``libmammotionjni.so`` and sent in the
+        ``Encrypt-Key`` header.
+
+        Tested against the live ``id.mammotion.com`` endpoint: returns a standard
+        OAuth JSON payload (``code: 0``, ``data.access_token`` …) just like the app.
+        The older Ma-* signed flow now returns ``40202 Account or password mismatch``
+        for accounts that the app logs in to successfully, so we use the encrypted
+        flow exclusively.
+        """
         self.account = account
         self._password = password
 
-        login_request = {
-            "username": account,
-            "password": base64.b64encode(password.encode("utf-8")).decode("utf-8"),
-            "client_id": MAMMOTION_OUATH2_CLIENT_ID,
-            "grant_type": "password",
-            "authType": "0",
-        }
+        enc = EncryptionUtils()
+        self.encryption_utils = enc
 
-        oauth_signature = create_oauth_signature(
-            login_req=login_request,
-            client_id=MAMMOTION_OUATH2_CLIENT_ID,
-            client_secret=MAMMOTION_OUATH2_CLIENT_SECRET,
-            token_endpoint="/oauth2/token",
-        )
+        params = {
+            "username": enc.encryption_by_aes(account),
+            "client_id": enc.encryption_by_aes(MAMMOTION_OUATH2_CLIENT_ID),
+            "client_secret": enc.encryption_by_aes(MAMMOTION_OUATH2_CLIENT_SECRET),
+            "grant_type": enc.encryption_by_aes("password"),
+            "password": enc.encryption_by_aes(password),
+        }
 
         async with self._client_session() as session:
             resp = await session.post(
-                f"{MAMMOTION_DOMAIN}/oauth2/token",
+                f"{MAMMOTION_DOMAIN}/oauth/token",
                 headers={
                     **self._headers,
-                    "Ma-App-Key": MAMMOTION_OUATH2_CLIENT_ID,
-                    "Ma-Signature": oauth_signature,
-                    "Ma-Timestamp": str(int(time.time())),
-                    "Client-Id": self.client_id,
-                    "Client-Type": "1",
+                    "Encrypt-Key": enc.encrypt_by_public_key(),
+                    "Decrypt-Type": "3",
+                    "Ec-Version": "v1",
                 },
-                params={
-                    **login_request,
-                },
+                params=params,
             )
             if resp.status != 200:
+                body = await resp.text()
+                _LOGGER.debug("login_v2 failed (status=%s): %s", resp.status, body)
                 return Response.from_dict({"code": resp.status, "msg": "Login failed"})
             data = await resp.json()
         if data.get("code") != 0:
-            return Response.from_dict({"code": resp.status, "msg": data.get("msg") or "Login failed"})
+            _LOGGER.debug("login_v2 non-zero code: %s", data)
+            return Response.from_dict({"code": data.get("code"), "msg": data.get("msg") or "Login failed"})
         login_response = response_factory(Response[LoginResponseData], data)
         if login_response is None or login_response.data is None:
             return Response.from_dict({"code": resp.status, "msg": "Login failed"})
@@ -689,6 +718,4 @@ class MammotionHTTP:
         self.response = login_response
         self.msg = login_response.msg
         self.code = login_response.code
-        # TODO catch errors from mismatch user / password elsewhere
-        # Assuming the data format matches the expected structure
         return login_response
