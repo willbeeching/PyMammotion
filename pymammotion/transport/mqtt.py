@@ -10,6 +10,7 @@ import json
 import logging
 import ssl
 from typing import TYPE_CHECKING
+import uuid
 
 from aiohttp import ClientConnectorDNSError
 import aiomqtt
@@ -179,23 +180,50 @@ class MQTTTransport(Transport):
             await self._notify_availability(TransportAvailability.DISCONNECTED)
 
     async def send(self, payload: bytes, iot_id: str = "") -> None:
-        """Send *payload* to the device via the Mammotion HTTP invoke API.
+        """Send *payload* to the device, preferring MQTT publish over HTTP.
+
+        When the MQTT client is connected, publishes directly to the broker's
+        service invoke topic — bypassing the rate-limited HTTP API.  Falls back
+        to the HTTP ``mqtt_invoke`` endpoint when MQTT is unavailable.
 
         Args:
             payload: Raw protobuf bytes to send.
             iot_id: Mammotion IoT device identifier for the target device.
 
         Raises:
-            TransportError: If iot_id is empty or the invoke call fails.
+            TransportError: If iot_id is empty or sending fails.
             AuthError: If the access token is expired (HTTP 401 or code 460).
 
         """
-        from pymammotion.aliyun.exceptions import DeviceOfflineException, GatewayTimeoutException
-        from pymammotion.http.model.http import UnauthorizedException
-
         if not iot_id:
             msg = "MQTTTransport.send() requires a non-empty iot_id"
             raise TransportError(msg)
+
+        if self._client is not None and self.is_connected and self._device_to_iot:
+            pk_dn = next(
+                (k for k, v in self._device_to_iot.items() if v == iot_id), None
+            )
+            if pk_dn is not None:
+                product_key, device_name = pk_dn
+                topic = f"/sys/{product_key}/{device_name}/thing/service/device_protobuf_sync_service"
+                envelope = json.dumps({
+                    "id": str(uuid.uuid4()),
+                    "version": "1.0",
+                    "params": {
+                        "content": base64.b64encode(payload).decode("ascii"),
+                    },
+                })
+                try:
+                    await self._client.publish(topic, envelope, qos=1)
+                    return
+                except Exception as exc:
+                    _logger.warning(
+                        "MQTT publish failed, falling back to HTTP: %s", exc
+                    )
+
+        from pymammotion.aliyun.exceptions import DeviceOfflineException, GatewayTimeoutException
+        from pymammotion.http.model.http import UnauthorizedException
+
         content = base64.b64encode(payload).decode()
         try:
             res = await self._http.mqtt_invoke(content, "", iot_id)
