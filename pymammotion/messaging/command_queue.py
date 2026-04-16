@@ -156,10 +156,12 @@ class DeviceCommandQueue:
                 if item.skip_if_saga_active and self.is_saga_active and item.priority > Priority.EXCLUSIVE:
                     continue
 
-                from pymammotion.aliyun.exceptions import GatewayTimeoutException
+                from pymammotion.aliyun.exceptions import GatewayTimeoutException, TooManyRequestsException
 
-                _gateway_timeout_max = 3
-                for _attempt in range(1, _gateway_timeout_max + 1):
+                _RETRY_MAX = 3
+                _RATE_LIMIT_BACKOFFS = (3.0, 6.0, 10.0)
+
+                for _attempt in range(1, _RETRY_MAX + 1):
                     self._current_work_task = asyncio.get_running_loop().create_task(
                         item.work()  # type: ignore[arg-type]
                     )
@@ -167,16 +169,33 @@ class DeviceCommandQueue:
                         await self._current_work_task
                         break  # success — exit retry loop
                     except GatewayTimeoutException:
-                        if _attempt < _gateway_timeout_max:
+                        if _attempt < _RETRY_MAX:
                             _logger.warning(
                                 "DeviceCommandQueue[%s]: gateway timeout (attempt %d/%d) — retrying",
                                 self._device_name,
                                 _attempt,
-                                _gateway_timeout_max,
+                                _RETRY_MAX,
                             )
                         else:
                             _logger.warning(
                                 "DeviceCommandQueue[%s]: gateway timeout after %d attempts — dropping command",
+                                self._device_name,
+                                _attempt,
+                            )
+                    except TooManyRequestsException:
+                        backoff = _RATE_LIMIT_BACKOFFS[min(_attempt - 1, len(_RATE_LIMIT_BACKOFFS) - 1)]
+                        if _attempt < _RETRY_MAX:
+                            _logger.warning(
+                                "DeviceCommandQueue[%s]: rate limited (attempt %d/%d) — retrying in %.1fs",
+                                self._device_name,
+                                _attempt,
+                                _RETRY_MAX,
+                                backoff,
+                            )
+                            await asyncio.sleep(backoff)
+                        else:
+                            _logger.warning(
+                                "DeviceCommandQueue[%s]: rate limited after %d attempts — dropping command",
                                 self._device_name,
                                 _attempt,
                             )

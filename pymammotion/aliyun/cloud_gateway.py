@@ -90,7 +90,6 @@ class CloudIOTGateway:
         self._app_key = APP_KEY
         self._app_secret = APP_SECRET
         self.domain = ALIYUN_DOMAIN
-        self.message_delay = 1
         self._client_id = self.generate_hardware_string(8)  # 8 characters
         self._device_sn = self.generate_hardware_string(32)  # 32 characters
         self._utdid = self.generate_hardware_string(32)  # 32 characters
@@ -831,14 +830,8 @@ class CloudIOTGateway:
         logger.debug(iot_id)
 
         if response.status_code == 429:
-            logger.debug("too many requests.")
-            if self.message_delay > 8:
-                raise TooManyRequestsException(response.status_message, iot_id)
-            asyncio.get_event_loop().call_later(
-                self.message_delay, lambda: asyncio.ensure_future(self.send_cloud_command(iot_id, command))
-            )
-            self.message_delay = self.message_delay * 2
-            return message_id
+            logger.warning("Cloud API rate limited (429) for iot_id=%s", iot_id)
+            raise TooManyRequestsException(response.status_message, iot_id)
 
         response_body_str = response.body.decode("utf-8")
         response_body_dict = self.parse_json_response(response_body_str)
@@ -867,9 +860,6 @@ class CloudIOTGateway:
             if response_body_dict.get("code") == 460:
                 logger.debug("iotToken expired, must re-login.")
                 raise SessionExpiredError(TransportType.CLOUD_ALIYUN, response_body_dict.get("message"))
-
-        if self.message_delay != 1:
-            self.message_delay = 1
 
         return message_id
 
