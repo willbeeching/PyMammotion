@@ -380,25 +380,22 @@ class AliyunMQTTTransport(Transport):
                 ) as client:
                     self._client = client
                     backoff = _MQTT_RECONNECT_MIN_SEC  # reset on successful connect
-                    await self._notify_availability(TransportAvailability.CONNECTED)
 
                     for topic in self._effective_subscribe_topics():
                         await client.subscribe(topic, qos=1)
 
-                    # Send the Aliyun IoT bind message to register the app client
+                    # Send the Aliyun IoT bind message and wait for a successful reply
+                    # before marking the transport as CONNECTED.
                     bind_topic = f"/sys/{self._config.product_key}/{self._config.device_name}/app/up/account/bind"
-                    await client.publish(
-                        bind_topic,
-                        json.dumps(
-                            {
-                                "id": "msgid1",
-                                "version": "1.0",
-                                "request": {"clientId": self._config.username},
-                                "params": {"iotToken": self._iot_token},
-                            }
-                        ),
-                        qos=1,
-                    )
+                    bind_ok = await self._bind_with_retry(client, bind_topic, max_attempts=3)
+                    if not bind_ok:
+                        _logger.warning(
+                            "Aliyun bind failed after retries — disconnecting to retry later"
+                        )
+                        continue
+
+                    await self._notify_availability(TransportAvailability.CONNECTED)
+                    _logger.info("AliyunMQTTTransport: connected and bound successfully")
 
                     async for message in client.messages:
                         if self._stop_event.is_set():
@@ -408,12 +405,7 @@ class AliyunMQTTTransport(Transport):
                         if topic.endswith("/thing/status"):
                             await self._dispatch_device_status(topic, raw)
                         elif topic.endswith("/account/bind_reply"):
-                            code = self._handle_bind_reply(raw)
-                            if code == 2043:
-                                raise SessionExpiredError(
-                                    TransportType.CLOUD_ALIYUN,
-                                    "Aliyun IoT token rejected by broker (bind_reply 2043) — token needs refresh",
-                                )
+                            pass
                         elif topic.endswith(("/thing/events", "/thing/properties")):
                             await self._dispatch_aliyun_event(topic, raw)
                         else:
@@ -505,6 +497,60 @@ class AliyunMQTTTransport(Transport):
         except Exception:  # noqa: BLE001
             _logger.debug("AliyunMQTTTransport: failed to parse bind_reply", exc_info=True)
         return code
+
+    async def _bind_with_retry(
+        self, client: aiomqtt.Client, bind_topic: str, max_attempts: int = 3
+    ) -> bool:
+        """Send the Aliyun bind message, retrying on transient failures (e.g. 2152).
+
+        Waits for the bind_reply on the message stream. Returns True on success,
+        False if all attempts are exhausted.  Raises SessionExpiredError for code
+        2043 (token rejected) so the outer loop can refresh credentials.
+        """
+        _BIND_DELAYS = (3.0, 6.0, 10.0)
+
+        for attempt in range(1, max_attempts + 1):
+            _logger.info(
+                "AliyunMQTTTransport: sending bind (attempt %d/%d)", attempt, max_attempts
+            )
+            await client.publish(
+                bind_topic,
+                json.dumps({
+                    "id": "msgid1",
+                    "version": "1.0",
+                    "request": {"clientId": self._config.username},
+                    "params": {"iotToken": self._iot_token},
+                }),
+                qos=1,
+            )
+
+            try:
+                async with asyncio.timeout(10):
+                    async for message in client.messages:
+                        topic = str(message.topic)
+                        if topic.endswith("/account/bind_reply"):
+                            code = self._handle_bind_reply(bytes(message.payload))
+                            if code == 200:
+                                return True
+                            if code == 2043:
+                                raise SessionExpiredError(
+                                    TransportType.CLOUD_ALIYUN,
+                                    "Aliyun IoT token rejected by broker (bind_reply 2043)",
+                                )
+                            break
+                        # Ignore other messages during bind handshake
+            except TimeoutError:
+                _logger.warning(
+                    "AliyunMQTTTransport: bind reply timed out (attempt %d/%d)",
+                    attempt, max_attempts,
+                )
+
+            if attempt < max_attempts:
+                delay = _BIND_DELAYS[min(attempt - 1, len(_BIND_DELAYS) - 1)]
+                _logger.info("AliyunMQTTTransport: retrying bind in %.0fs", delay)
+                await asyncio.sleep(delay)
+
+        return False
 
     async def _dispatch_aliyun_event(self, topic: str, raw: bytes) -> None:
         """Dispatch a thing/events or thing/properties message.
