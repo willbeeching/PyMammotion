@@ -22,6 +22,7 @@ import logging
 import ssl
 import time
 from typing import TYPE_CHECKING
+import uuid
 
 import aiomqtt
 from Tea.exceptions import UnretryableException
@@ -232,19 +233,47 @@ class AliyunMQTTTransport(Transport):
         self._client = None
 
     async def send(self, payload: bytes, iot_id: str = "") -> None:
-        """Send *payload* to the device via the Aliyun HTTP invoke API.
+        """Send *payload* to the device via MQTT publish.
+
+        Publishes to the Aliyun IoT ``thing/service/invoke`` topic, bypassing
+        the rate-limited HTTP API entirely.  Falls back to the HTTP API if the
+        MQTT client is not currently connected.
 
         Args:
             payload: Raw protobuf bytes to send.
             iot_id: Aliyun IoT device identifier for the target device.
 
         Raises:
-            TransportError: If iot_id is empty.
+            TransportError: If iot_id is empty or sending fails.
 
         """
         if not iot_id:
             msg = "AliyunMQTTTransport.send() requires a non-empty iot_id"
             raise TransportError(msg)
+
+        if self._client is not None and self.is_connected:
+            topic = (
+                f"/sys/{self._config.product_key}/{self._config.device_name}"
+                f"/app/up/thing/service/invoke"
+            )
+            message_id = str(uuid.uuid4())
+            envelope = json.dumps({
+                "id": message_id,
+                "version": "1.0",
+                "params": {
+                    "iotId": iot_id,
+                    "identifier": "device_protobuf_sync_service",
+                    "args": {"content": base64.b64encode(payload).decode("ascii")},
+                },
+            })
+            try:
+                await self._client.publish(topic, envelope, qos=1)
+                return
+            except Exception as exc:
+                _logger.warning(
+                    "MQTT publish failed, falling back to HTTP: %s", exc
+                )
+
         try:
             await self._cloud_gateway.send_cloud_command(iot_id, payload)
         except UnretryableException as ex:
@@ -292,6 +321,7 @@ class AliyunMQTTTransport(Transport):
             f"{base}/app/down/thing/status",
             f"{base}/app/down/thing/properties",
             f"{base}/app/down/thing/model/down_raw",
+            f"{base}/app/down/thing/service/invoke/reply",
         ]
 
     def _effective_subscribe_topics(self) -> list[str]:
